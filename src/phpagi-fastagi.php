@@ -43,7 +43,7 @@
   // in the same directory (or subdirectory)
   $mydir = dirname($fastagi->config['fastagi']['basedir']) . DIRECTORY_SEPARATOR;
   $dir = dirname($script) . DIRECTORY_SEPARATOR;
-  if(substr($dir, 0, strlen($mydir)) != $mydir)
+  if(!str_starts_with($dir, $mydir))
   {
     $fastagi->conlog("$script is not allowed to execute.");
     exit;

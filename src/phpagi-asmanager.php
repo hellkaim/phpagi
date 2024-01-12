@@ -44,10 +44,10 @@
    /**
     * Config variables
     *
-    * @var array
+    * @var array|false
     * @access public
     */
-    public $config;
+    public array|false $config;
 
    /**
     * Socket
@@ -62,7 +62,7 @@
     * @access public
     * @var string
     */
-    public $server;
+    public string $server;
 
    /**
     * Port on the server we are connected to
@@ -70,15 +70,15 @@
     * @access public
     * @var integer
     */
-    public $port;
+    public int $port;
 
    /**
     * Parent AGI
     *
     * @access private
-    * @var AGI
+    * @var AGI|bool
     */
-    public $pagi = false;
+    public AGI|bool $pagi = false;
 
    /**
     * Event Handlers
@@ -86,7 +86,7 @@
     * @access private
     * @var array
     */
-    private $event_handlers;
+    private array $event_handlers;
 
     private $_buffer = null;
 
@@ -96,9 +96,9 @@
      * @access private
      * @var boolean
      */
-    private $_logged_in = false;
+    private bool $_logged_in = false;
 
-    public function setPagi(&$agi)
+    public function setPagi($agi)
     {
       $this->pagi = $agi;
     }
@@ -106,10 +106,10 @@
    /**
     * Constructor
     *
-    * @param string $config is the name of the config file to parse or a parent agi from which to read the config
+    * @param string|null $config is the name of the config file to parse or a parent agi from which to read the config
     * @param array $optconfig is an array of configuration vars and vals, stuffed into $this->config['asmanager']
     */
-    function __construct($config=null, $optconfig=array())
+    function __construct(string $config=null, array $optconfig=array())
     {
       // load config
       if(!is_null($config) && file_exists($config))
@@ -129,14 +129,15 @@
       if(!isset($this->config['asmanager']['write_log'])) $this->config['asmanager']['write_log'] = false;
     }
 
-   /**
-    * Send a request
-    *
-    * @param string $action
-    * @param array $parameters
-    * @return array of parameters
-    */
-    function send_request($action, $parameters=array())
+      /**
+       * Send a request
+       *
+       * @param string $action
+       * @param array $parameters
+       * @return array of parameters
+       * @throws Exception
+       */
+    function send_request(string $action, array $parameters=array()): array
     {
       $req = "Action: $action\r\n";
       $actionid = null;
@@ -163,115 +164,92 @@
       return $this->wait_response(false, $actionid);
     }
 
-    function read_one_msg($allow_timeout = false)
-    {
-      $type = null;
+      /**
+       * Process an event. Code updated to simplify logic and remove unused variables.
+       * @param false $allow_timeout
+       * @return array
+       * @throws Exception
+       */
+      function read_one_msg(false $allow_timeout = false)
+      {
+          do {
+              $buf = fgets($this->socket, 4096);
+              if (false === $buf) {
+                  throw new Exception("Error reading from AMI socket");
+              }
+              $this->_buffer .= $buf;
 
-      do {
-        $buf = fgets($this->socket, 4096);
-        if (false === $buf) {
-          throw new Exception("Error reading from AMI socket");
-        }
-        $this->_buffer .= $buf;
+              if (strpos($this->_buffer, "\r\n\r\n") !== false) {
+                  // Full message in buffer
+                  break;
+              }
+              if (feof($this->socket) && !$allow_timeout) {
+                  throw new Exception("Read timeout on AMI socket");
+              }
+          } while (!feof($this->socket));
 
-        $pos = strpos($this->_buffer, "\r\n\r\n");
-        if (false !== $pos) {
-          // there's a full message in the buffer
-          break;
-        }
-      } while (!feof($this->socket));
+          $pos = strpos($this->_buffer, "\r\n\r\n");
+          $msg = substr($this->_buffer, 0, $pos);
+          $this->_buffer = substr($this->_buffer, $pos + 4);
 
-      $msg = substr($this->_buffer, 0, $pos);
-      $this->_buffer = substr($this->_buffer, $pos+4);
+          $msgarr = explode("\r\n", $msg);
+          $parameters = array();
 
-      $msgarr = explode("\r\n", $msg);
-
-      $parameters = array();
-
-      $r = explode(': ', $msgarr[0]);
-      $type = strtolower($r[0]);
-
-      if ($r[1] == 'Success' || $r[1] == 'Follows') {
-          $m = explode(': ', $msgarr[2]);
-          $msgarr_tmp = $msgarr;
-          $str = array_pop($msgarr);
-          $lastline = strpos($str, '--END COMMAND--');
-          if (false !== $lastline) {
-              $parameters['data'] = substr($str, 0, $lastline-1); // cut '\n' too
-          } else {
-              if ($m[1] == 'Command output follows') {
-                  $n = 3;
-                  $c = count($msgarr_tmp) - 1;
-                  $output = explode(': ', $msgarr_tmp[3]);
-                  if ($output[1]) {
-                      $data = $output[1];
-                      while ($n++<$c) {
-                          $output = explode(': ', $msgarr_tmp[$n]);
-                          if ($output[1]) {
-                              $data .= "\n".$output[1];
-                          }
-                      }
-                      $parameters['data'] = $data;
-                  }
+          foreach ($msgarr as $str) {
+              $kv = explode(':', $str, 2);
+              if (isset($kv[1])) {
+                  $key = trim($kv[0]);
+                  $val = trim($kv[1]);
+                  $parameters[$key] = $val;
               }
           }
+
+          $responseType = strtolower(explode(': ', $msgarr[0])[0]);
+
+          // Process response based on type
+          switch ($responseType) {
+              case 'event':
+                  $this->process_event($parameters);
+                  break;
+              case 'response':
+                  // Handle response
+                  break;
+              default:
+                  if ($responseType !== '') {
+                      $this->log('Unhandled response packet from Manager: ' . print_r($parameters, true));
+                  }
+                  break;
+          }
+
+          return $parameters;
       }
 
-      foreach ($msgarr as $num=>$str) {
-        $kv = explode(':', $str, 2);
-        if (!isset($kv[1])) {
-          $kv[1] = "";
-        }
-        $key = trim($kv[0]);
-        $val = trim($kv[1]);
-        $parameters[$key] = $val;
-      }
-
-      // process response
-      switch($type)
-      {
-        case '': // timeout occured
-          $timeout = $allow_timeout;
-          break;
-        case 'event':
-          $this->process_event($parameters);
-          break;
-        case 'response':
-          break;
-        default:
-          $this->log('Unhandled response packet from Manager: ' . print_r($parameters, true));
-          break;
-      }
-
-      return $parameters;
-    }
-
-   /**
-    * Wait for a response
-    *
-    * If a request was just sent, this will return the response.
-    * Otherwise, it will loop forever, handling events.
-    *
-    * XXX this code is slightly better then the original one
-    * however it's still totally screwed up and needs to be rewritten,
-    * for two reasons at least:
-    * 1. it does not handle socket errors in any way
-    * 2. it is terribly synchronous, esp. with eventlists,
-    *    i.e. your code is blocked on waiting until full responce is received
-    *
-    * @param boolean $allow_timeout if the socket times out, return an empty array
-    * @return array of parameters, empty on timeout
-    */
-    function wait_response($allow_timeout = false, $actionid = null)
+      /**
+       * Wait for a response
+       *
+       * If a request was just sent, this will return the response.
+       * Otherwise, it will loop forever, handling events.
+       *
+       * XXX this code is slightly better than the original one
+       * however it's still totally screwed up and needs to be rewritten,
+       * for two reasons at least:
+       * 1. it does not handle socket errors in any way
+       * 2. it is terribly synchronous, esp. with eventlists,
+       *    i.e. your code is blocked on waiting until full responce is received
+       *
+       * @param boolean $allow_timeout if the socket times out, return an empty array
+       * @param null $actionid
+       * @return array of parameters, empty on timeout
+       * @throws Exception
+       */
+    function wait_response(bool $allow_timeout = false, $actionid = null): array
     {
-      $res = array();
       if ($actionid) {
         do {
           $res = $this->read_one_msg($allow_timeout);
         } while (!( isset($res['ActionID']) && $res['ActionID']==$actionid ));
       } else {
-        $res = $this->read_one_msg($allow_timeout);
-        return $res;
+          return $this->read_one_msg($allow_timeout);
       }
 
       if (isset($res['EventList']) && $res['EventList']=='start') {
@@ -293,14 +271,14 @@
    /**
     * Connect to Asterisk
     *
-    * @example examples/sip_show_peer.php Get information about a sip peer
-    *
-    * @param string $server
-    * @param string $username
-    * @param string $secret
+    * @param string|null $server
+    * @param string|null $username
+    * @param string|null $secret
     * @return boolean true on success
+    *@example examples/sip_show_peer.php Get information about a sip peer
+    *
     */
-    function connect($server=null, $username=null, $secret=null)
+    function connect(string $server=null, string $username=null, string $secret=null)
     {
       // use config if not specified
       if(is_null($server)) $server = $this->config['asmanager']['server'];
@@ -308,7 +286,7 @@
       if(is_null($secret)) $secret = $this->config['asmanager']['secret'];
 
       // get port from server if specified
-      if(strpos($server, ':') !== false)
+      if(str_contains($server, ':'))
       {
         $c = explode(':', $server);
         $this->server = $c[0];
@@ -323,15 +301,15 @@
       // connect the socket
       $errno = $errstr = null;
       $this->socket = @fsockopen($this->server, $this->port, $errno, $errstr);
-      if($this->socket == false)
+      if(!$this->socket)
       {
-        $this->log("Unable to connect to manager {$this->server}:{$this->port} ($errno): $errstr");
+        $this->log("Unable to connect to manager $this->server:$this->port ($errno): $errstr");
         return false;
       }
 
       // read the header
       $str = fgets($this->socket);
-      if($str == false)
+      if(!$str)
       {
         // a problem.
         $this->log("Asterisk Manager header not received.");
@@ -339,7 +317,8 @@
       }
       else
       {
-        // note: don't $this->log($str) until someone looks to see why it mangles the logging
+        // note: don't $this->log($str) until someone looks to see why it mangles the logging//
+        $this->log("Received header of length/" . strlen($str));
       }
 
       // login
@@ -362,7 +341,7 @@
     */
     function disconnect()
     {
-      if($this->_logged_in==true)
+      if($this->_logged_in)
         $this->logoff();
       fclose($this->socket);
     }
@@ -380,7 +359,7 @@
     * @param string $channel Channel name to hangup
     * @param integer $timeout Maximum duration of the call (sec)
     */
-    function AbsoluteTimeout($channel, $timeout)
+    function AbsoluteTimeout(string $channel, int $timeout)
     {
       return $this->send_request('AbsoluteTimeout', array('Channel'=>$channel, 'Timeout'=>$timeout));
     }
@@ -392,7 +371,7 @@
     * @param string $channel the channel to record.
     * @param string $file the new name of the file created in the monitor spool directory.
     */
-    function ChangeMonitor($channel, $file)
+    function ChangeMonitor(string $channel, string $file)
     {
       return $this->send_request('ChangeMontior', array('Channel'=>$channel, 'File'=>$file));
     }
@@ -400,13 +379,13 @@
    /**
     * Execute Command
     *
+    * @param string $command
+    * @param string|null $actionid message matching variable
+    *@link http://www.voip-info.org/wiki-Asterisk+CLI
     * @example examples/sip_show_peer.php Get information about a sip peer
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+Command
-    * @link http://www.voip-info.org/wiki-Asterisk+CLI
-    * @param string $command
-    * @param string $actionid message matching variable
     */
-    function Command($command, $actionid=null)
+    function Command(string $command, string $actionid=null)
     {
       $parameters = array('Command'=>$command);
       if($actionid) $parameters['ActionID'] = $actionid;
@@ -419,7 +398,7 @@
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+Events
     * @param string $eventmask is either 'on', 'off', or 'system,call,log'
     */
-    function Events($eventmask)
+    function Events(string $eventmask)
     {
       return $this->send_request('Events', array('EventMask'=>$eventmask));
     }
@@ -432,14 +411,17 @@
       return "A".sprintf(rand(),"%6d");
     }
 
-    /**
-    *
-    *  DBGet
-    *  http://www.voip-info.org/wiki/index.php?page=Asterisk+Manager+API+Action+DBGet
-    *  @param string $family key family
-    *  @param string $key key name
-    **/
-    function DBGet($family, $key, $actionid = null)
+      /**
+       *
+       *  DBGet
+       *  http://www.voip-info.org/wiki/index.php?page=Asterisk+Manager+API+Action+DBGet
+       * @param string $family key family
+       * @param string $key key name
+       * @param string|null $actionid message matching variable
+       *
+       * @throws Exception
+       */
+    function DBGet(string $family, string $key, string $actionid = null)
     {
       $parameters = array('Family'=>$family, 'Key'=>$key);
       if($actionid == null)
@@ -460,9 +442,9 @@
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+ExtensionState
     * @param string $exten Extension to check state on
     * @param string $context Context for extension
-    * @param string $actionid message matching variable
+    * @param string|null $actionid message matching variable
     */
-    function ExtensionState($exten, $context, $actionid=null)
+    function ExtensionState(string $exten, string $context, string $actionid=null)
     {
       $parameters = array('Exten'=>$exten, 'Context'=>$context);
       if($actionid) $parameters['ActionID'] = $actionid;
@@ -476,9 +458,9 @@
     * @link http://www.voip-info.org/wiki-Asterisk+variables
     * @param string $channel Channel to read variable from
     * @param string $variable
-    * @param string $actionid message matching variable
+    * @param string|null $actionid message matching variable
     */
-    function GetVar($channel, $variable, $actionid=null)
+    function GetVar(string $channel, string $variable, string $actionid=null)
     {
       $parameters = array('Channel'=>$channel, 'Variable'=>$variable);
       if($actionid) $parameters['ActionID'] = $actionid;
@@ -491,7 +473,7 @@
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+Hangup
     * @param string $channel The channel name to be hungup
     */
-    function Hangup($channel)
+    function Hangup(string $channel)
     {
       return $this->send_request('Hangup', array('Channel'=>$channel));
     }
@@ -510,9 +492,9 @@
     * List available manager commands
     *
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+ListCommands
-    * @param string $actionid message matching variable
+    * @param string|null $actionid message matching variable
     */
-    function ListCommands($actionid=null)
+    function ListCommands(string $actionid=null)
     {
       if($actionid)
         return $this->send_request('ListCommands', array('ActionID'=>$actionid));
@@ -541,9 +523,9 @@
     *
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+MailboxCount
     * @param string $mailbox Full mailbox ID <mailbox>@<vm-context>
-    * @param string $actionid message matching variable
+    * @param string|null $actionid message matching variable
     */
-    function MailboxCount($mailbox, $actionid=null)
+    function MailboxCount(string $mailbox, string $actionid=null)
     {
       $parameters = array('Mailbox'=>$mailbox);
       if($actionid) $parameters['ActionID'] = $actionid;
@@ -560,9 +542,9 @@
     *
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+MailboxStatus
     * @param string $mailbox Full mailbox ID <mailbox>@<vm-context>
-    * @param string $actionid message matching variable
+    * @param string|null $actionid message matching variable
     */
-    function MailboxStatus($mailbox, $actionid=null)
+    function MailboxStatus(string $mailbox, string $actionid=null)
     {
       $parameters = array('Mailbox'=>$mailbox);
       if($actionid) $parameters['ActionID'] = $actionid;
@@ -574,11 +556,11 @@
     *
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+Monitor
     * @param string $channel
-    * @param string $file
-    * @param string $format
-    * @param boolean $mix
+    * @param string|null $file
+    * @param string|null $format
+    * @param boolean|null $mix
     */
-    function Monitor($channel, $file=null, $format=null, $mix=null)
+    function Monitor(string $channel, string $file=null, string $format=null, bool $mix=null)
     {
       $parameters = array('Channel'=>$channel);
       if($file) $parameters['File'] = $file;
@@ -592,22 +574,22 @@
     *
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+Originate
     * @param string $channel Channel name to call
-    * @param string $exten Extension to use (requires 'Context' and 'Priority')
-    * @param string $context Context to use (requires 'Exten' and 'Priority')
-    * @param string $priority Priority to use (requires 'Exten' and 'Context')
-    * @param string $application Application to use
-    * @param string $data Data to use (requires 'Application')
-    * @param integer $timeout How long to wait for call to be answered (in ms)
-    * @param string $callerid Caller ID to be set on the outgoing channel
-    * @param string $variable Channel variable to set (VAR1=value1|VAR2=value2)
-    * @param string $account Account code
-    * @param boolean $async true fast origination
-    * @param string $actionid message matching variable
+    * @param string|null $exten Extension to use (requires 'Context' and 'Priority')
+    * @param string|null $context Context to use (requires 'Exten' and 'Priority')
+    * @param string|null $priority Priority to use (requires 'Exten' and 'Context')
+    * @param string|null $application Application to use
+    * @param string|null $data Data to use (requires 'Application')
+    * @param integer|null $timeout How long to wait for call to be answered (in ms)
+    * @param string|null $callerid Caller ID to be set on the outgoing channel
+    * @param string|null $variable Channel variable to set (VAR1=value1|VAR2=value2)
+    * @param string|null $account Account code
+    * @param boolean|null $async true fast origination
+    * @param string|null $actionid message matching variable
     */
-    function Originate($channel,
-                       $exten=null, $context=null, $priority=null,
-                       $application=null, $data=null,
-                       $timeout=null, $callerid=null, $variable=null, $account=null, $async=null, $actionid=null)
+    function Originate(string $channel,
+                       string $exten=null, string $context=null, string $priority=null,
+                       string $application=null, string $data=null,
+                       int    $timeout=null, string $callerid=null, string $variable=null, string $account=null, bool $async=null, string $actionid=null)
     {
       $parameters = array('Channel'=>$channel);
 
@@ -632,9 +614,9 @@
     * List parked calls
     *
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+ParkedCalls
-    * @param string $actionid message matching variable
+    * @param string|null $actionid message matching variable
     */
-    function ParkedCalls($actionid=null)
+    function ParkedCalls(string $actionid=null)
     {
       if($actionid)
         return $this->send_request('ParkedCalls', array('ActionID'=>$actionid));
@@ -659,9 +641,9 @@
     * @param string $queue
     * @param string $interface
     * @param integer $penalty
-    * @param string $memberName
+    * @param false|string $memberName
     */
-    function QueueAdd($queue, $interface, $penalty=0, $memberName = false)
+    function QueueAdd(string $queue, string $interface, int $penalty=0, false|string $memberName = false)
     {
       $parameters = array('Queue'=>$queue, 'Interface'=>$interface);
       if($penalty) $parameters['Penalty'] = $penalty;
@@ -676,7 +658,7 @@
     * @param string $queue
     * @param string $interface
     */
-    function QueueRemove($queue, $interface)
+    function QueueRemove(string $queue, string $interface)
     {
       return $this->send_request('QueueRemove', array('Queue'=>$queue, 'Interface'=>$interface));
     }
@@ -700,9 +682,9 @@
     * Queue Status
     *
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+QueueStatus
-    * @param string $actionid message matching variable
+    * @param string|null $actionid message matching variable
     */
-    function QueueStatus($actionid=null)
+    function QueueStatus(string $actionid=null)
     {
       if($actionid)
         return $this->send_request('QueueStatus', array('ActionID'=>$actionid));
@@ -720,7 +702,7 @@
     * @param string $context
     * @param string $priority
     */
-    function Redirect($channel, $extrachannel, $exten, $context, $priority)
+    function Redirect(string $channel, string $extrachannel, string $exten, string $context, string $priority)
     {
       return $this->send_request('Redirect', array('Channel'=>$channel, 'ExtraChannel'=>$extrachannel, 'Exten'=>$exten,
                                                    'Context'=>$context, 'Priority'=>$priority));
@@ -738,9 +720,9 @@
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+SetCDRUserField
     * @param string $userfield
     * @param string $channel
-    * @param string $append
+    * @param string|null $append
     */
-    function SetCDRUserField($userfield, $channel, $append=null)
+    function SetCDRUserField(string $userfield, string $channel, string $append=null)
     {
       $parameters = array('UserField'=>$userfield, 'Channel'=>$channel);
       if($append) $parameters['Append'] = $append;
@@ -755,7 +737,7 @@
     * @param string $variable name
     * @param string $value
     */
-    function SetVar($channel, $variable, $value)
+    function SetVar(string $channel, string $variable, string $value)
     {
       return $this->send_request('SetVar', array('Channel'=>$channel, 'Variable'=>$variable, 'Value'=>$value));
     }
@@ -765,9 +747,9 @@
     *
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+Status
     * @param string $channel
-    * @param string $actionid message matching variable
+    * @param string|null $actionid message matching variable
     */
-    function Status($channel, $actionid=null)
+    function Status(string $channel, string $actionid=null)
     {
       $parameters = array('Channel'=>$channel);
       if($actionid) $parameters['ActionID'] = $actionid;
@@ -780,7 +762,7 @@
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+StopMonitor
     * @param string $channel
     */
-    function StopMonitor($channel)
+    function StopMonitor(string $channel)
     {
       return $this->send_request('StopMonitor', array('Channel'=>$channel));
     }
@@ -792,7 +774,7 @@
     * @param string $zapchannel
     * @param string $number
     */
-    function ZapDialOffhook($zapchannel, $number)
+    function ZapDialOffhook(string $zapchannel, string $number)
     {
       return $this->send_request('ZapDialOffhook', array('ZapChannel'=>$zapchannel, 'Number'=>$number));
     }
@@ -803,7 +785,7 @@
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+ZapDNDoff
     * @param string $zapchannel
     */
-    function ZapDNDoff($zapchannel)
+    function ZapDNDoff(string $zapchannel)
     {
       return $this->send_request('ZapDNDoff', array('ZapChannel'=>$zapchannel));
     }
@@ -814,7 +796,7 @@
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+ZapDNDon
     * @param string $zapchannel
     */
-    function ZapDNDon($zapchannel)
+    function ZapDNDon(string $zapchannel)
     {
       return $this->send_request('ZapDNDon', array('ZapChannel'=>$zapchannel));
     }
@@ -825,7 +807,7 @@
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+ZapHangup
     * @param string $zapchannel
     */
-    function ZapHangup($zapchannel)
+    function ZapHangup(string $zapchannel)
     {
       return $this->send_request('ZapHangup', array('ZapChannel'=>$zapchannel));
     }
@@ -836,7 +818,7 @@
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+ZapTransfer
     * @param string $zapchannel
     */
-    function ZapTransfer($zapchannel)
+    function ZapTransfer(string $zapchannel)
     {
       return $this->send_request('ZapTransfer', array('ZapChannel'=>$zapchannel));
     }
@@ -845,9 +827,9 @@
     * Zap Show Channels
     *
     * @link http://www.voip-info.org/wiki-Asterisk+Manager+API+Action+ZapShowChannels
-    * @param string $actionid message matching variable
+    * @param string|null $actionid message matching variable
     */
-    function ZapShowChannels($actionid=null)
+    function ZapShowChannels(string $actionid=null)
     {
       if($actionid)
         return $this->send_request('ZapShowChannels', array('ActionID'=>$actionid));
@@ -867,8 +849,9 @@
     */
     function log($message, $level=1)
     {
-      if($this->pagi != false)
-        $this->pagi->conlog($message, $level);
+      if($this->pagi) {
+          $this->pagi->conlog($message, $level);
+      }
       elseif($this->config['asmanager']['write_log'])
         error_log(date('r') . ' - ' . $message);
     }
@@ -913,7 +896,7 @@
     * @param string $callback function
     * @return boolean sucess
     */
-    function add_event_handler($event, $callback)
+    function add_event_handler(string $event, string $callback)
     {
       $event = strtolower($event);
       if(isset($this->event_handlers[$event]))
@@ -931,7 +914,7 @@
     *   @param string $event type or * for default handler
     *   @return boolean sucess
     **/
-    function remove_event_handler($event)
+    function remove_event_handler(string $event)
     {
       $event = strtolower($event);
       if(isset($this->event_handlers[$event]))
@@ -950,7 +933,7 @@
     * @param array $parameters
     * @return mixed result of event handler or false if no handler was found
     */
-    function process_event($parameters)
+    function process_event(array $parameters)
     {
       $ret = false;
       $e = strtolower($parameters['Event']);

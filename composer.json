@@ -9,5 +9,9 @@
             "src/phpagi-asmanager.php"
         ]
     },
-    "require": {}
+    "require": {
+      "ext-sockets": "*",
+        "ext-posix": "*",
+        "ext-mysqli": "*"
+    }
 }
